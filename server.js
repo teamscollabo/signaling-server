@@ -1,158 +1,188 @@
+// server.js
 const express = require('express');
 const ws = require('ws');
 const http = require('http');
 
-/** @type {Map<string, Set<ws>>} */
 const topics = new Map();
-
-/** @type {number} */
 const PORT = process.env.PORT || 8787;
 
-// Create an Express app and an HTTP server instance
+// --- Express app & HTTP server ---
 const app = express();
+app.set('trust proxy', 1); // Render/any proxy
+
+// Basic health checks (Render can ping this)
+app.get('/healthz', (_req, res) => res.status(200).type('text/plain').send('ok'));
+app.get('/', (_req, res) => res.status(200).type('text/plain').send('Signaling server is running'));
+
 const server = http.createServer(app);
 
-// Simple HTTP handler for health check
-app.get('/', (req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Signaling server is running');
+// --- Optional: restrict WS to a path ---
+const WS_PATH = process.env.WS_PATH || '/ws';
+
+// --- Security: allowed origins for WS upgrades ---
+const ALLOWED_ORIGINS = new Set([
+  'https://your-frontend.example.com',
+  'https://your-frontend.onrender.com',
+  // add dev origins if needed:
+  'http://localhost:3000'
+]);
+
+// Pre-upgrade origin check (runs before ws accepts)
+server.on('upgrade', (req, socket, head) => {
+  try {
+    // Only enforce origin checks when an Origin header is present (browsers).
+    const origin = req.headers.origin;
+    const url = new URL(req.url, 'http://x'); // base required but ignored for path compare
+
+    if (url.pathname !== WS_PATH) {
+      socket.destroy();
+      return;
+    }
+
+    if (origin && !ALLOWED_ORIGINS.has(origin)) {
+      socket.destroy();
+      return;
+    }
+
+    // Hand off to ws server if checks pass
+    wss.handleUpgrade(req, socket, head, (wsSocket) => {
+      wss.emit('connection', wsSocket, req);
+    });
+  } catch {
+    socket.destroy();
+  }
 });
 
-// Create the WebSocket Server using the HTTP server
-const wss = new ws.Server({ server });
+// --- WebSocket server ---
+const wss = new ws.Server({ noServer: true, clientTracking: true /* default */ });
 
 const wsReadyStateOpen = 1;
 
-/**
- * Sends a JSON message to a connection, handling closed connections.
- * @param {ws} conn
- * @param {object} message
- */
 const send = (conn, message) => {
-    if (conn.readyState !== wsReadyStateOpen) {
-        conn.close();
-        return;
-    }
-    try {
-        // Send the raw message (already in JSON format from 'publish' or 'ping')
-        conn.send(JSON.stringify(message));
-    } catch (e) {
-        conn.close();
-    }
-}
+  if (conn.readyState !== wsReadyStateOpen) {
+    try { conn.close(); } catch {}
+    return;
+  }
+  try {
+    // Consider backpressure; skip if too backed up
+    if (conn.bufferedAmount > 1_000_000) return; // ~1MB queued
+    conn.send(JSON.stringify(message));
+  } catch {
+    try { conn.close(); } catch {}
+  }
+};
 
 wss.on('connection', (socket, req) => {
-    console.log(`Client connected from: ${req.socket.remoteAddress}`);
+  console.log(`WS connected from ${req.socket.remoteAddress} (origin: ${req.headers.origin || 'n/a'})`);
+  socket.isAlive = true;
 
-    socket.isAlive = true;
-    
-    /** @type {Set<string>} */
-    const subscribedTopics = new Set();
+  const subscribedTopics = new Set();
 
-    socket.on('error', console.error);
+  socket.on('error', (err) => console.error('WS error:', err?.message || err));
 
-    socket.on('pong', () => {
-        socket.isAlive = true;
-    });
+  socket.on('pong', () => { socket.isAlive = true; });
 
-    socket.on('message', (data) => {
-        let message;
-        try {
-            // All y-webrtc signaling messages are JSON
-            message = JSON.parse(data.toString());
-        } catch (e) {
-            console.warn('Received invalid non-JSON message. Discarding.');
-            return;
+  socket.on('message', (data) => {
+    let message;
+    try {
+      message = JSON.parse(data.toString());
+    } catch {
+      console.warn('Discarding non-JSON message');
+      return;
+    }
+
+    switch (message?.type) {
+      case 'subscribe': {
+        const list = Array.isArray(message.topics) ? message.topics : [];
+        // Defensive: cap number of topics per message to prevent abuse
+        for (const topicName of list.slice(0, 64)) {
+          if (typeof topicName !== 'string' || !topicName) continue;
+          let subscribers = topics.get(topicName);
+          if (!subscribers) {
+            subscribers = new Set();
+            topics.set(topicName, subscribers);
+          }
+          subscribers.add(socket);
+          subscribedTopics.add(topicName);
+          console.log(`Join room "${topicName}" :: ${subscribers.size} clients`);
         }
+        break;
+      }
 
-        if (message && message.type) {
-            switch (message.type) {
-                case 'subscribe':
-                    /** @type {Array<string>} */ 
-                    (message.topics || []).forEach(topicName => {
-                        if (typeof topicName === 'string') {
-                            // Add connection to topic Set
-                            const subscribers = topics.get(topicName) || new Set();
-                            subscribers.add(socket);
-                            topics.set(topicName, subscribers);
-
-                            // Add topic to connection's set for cleanup
-                            subscribedTopics.add(topicName);
-                            console.log(`Client joined room: ${topicName}. Total clients in room: ${subscribers.size}`);
-                        }
-                    });
-                    break;
-
-                case 'publish':
-                    if (message.topic) {
-                        const receivers = topics.get(message.topic);
-
-                        if (receivers) {
-                            // Relay the message to all other clients in the room
-                            receivers.forEach(receiver => {
-                                if (socket !== receiver) {
-                                    // Send the message object directly (will be stringified by send function)
-                                    send(receiver, message);
-                                }
-                            });
-                        }
-                    }
-                    break;
-
-                case 'unsubscribe':
-                    /** @type {Array<string>} */ 
-                    (message.topics || []).forEach(topicName => {
-                        const subscribers = topics.get(topicName);
-                        if (subscribers) {
-                            subscribers.delete(socket);
-                        }
-                    });
-                    break;
-
-                case 'ping':
-                    // Client pings the server (uncommon, but handled)
-                    send(socket, { type: 'pong' });
-                    break;
-
-                default:
-                    console.log(`Unhandled message type: ${message.type}`);
-                    break;
-            }
+      case 'publish': {
+        const t = message.topic;
+        if (typeof t === 'string' && t) {
+          const receivers = topics.get(t);
+          if (receivers) {
+            receivers.forEach((receiver) => {
+              if (receiver !== socket) send(receiver, message);
+            });
+          }
         }
-    });
+        break;
+      }
 
-    socket.on('close', () => {
-        console.log('Client disconnected.');
-        
-        // Remove client from all subscribed topics
-        subscribedTopics.forEach(topicName => {
-            const subscribers = topics.get(topicName);
-            if (subscribers) {
-                subscribers.delete(socket);
-                console.log(`Client left room: ${topicName}. Remaining: ${subscribers.size}`);
-                if (subscribers.size === 0) {
-                    topics.delete(topicName); // Clean up empty rooms
-                }
-            }
-        });
-        subscribedTopics.clear();
+      case 'unsubscribe': {
+        const list = Array.isArray(message.topics) ? message.topics : [];
+        for (const topicName of list) {
+          const subscribers = topics.get(topicName);
+          if (subscribers) {
+            subscribers.delete(socket);
+            subscribedTopics.delete(topicName);
+            if (subscribers.size === 0) topics.delete(topicName);
+          }
+        }
+        break;
+      }
+
+      case 'ping': {
+        send(socket, { type: 'pong' });
+        break;
+      }
+
+      default:
+        console.log(`Unhandled message type: ${message?.type}`);
+    }
+  });
+
+  socket.on('close', () => {
+    // Remove from all subscribed topics
+    subscribedTopics.forEach((topicName) => {
+      const subscribers = topics.get(topicName);
+      if (subscribers) {
+        subscribers.delete(socket);
+        console.log(`Left room "${topicName}" :: remaining ${subscribers.size}`);
+        if (subscribers.size === 0) topics.delete(topicName);
+      }
     });
+    subscribedTopics.clear();
+  });
 });
 
-// PING/PONG heartbeating for keeping connections alive
+// Heartbeat (keep-alive & dead-peer cleanup)
 const checkAliveInterval = setInterval(() => {
-    wss.clients.forEach(socket => {
-        if (socket.isAlive === false) {
-            return socket.terminate();
-        }
-        socket.isAlive = false;
-        try {
-            socket.ping();
-        } catch (e) {
-            // Error on ping, close connection
-            socket.terminate();
-        }
-    });
-}, 30000);
+  wss.clients.forEach((socket) => {
+    if (socket.isAlive === false) {
+      return socket.terminate();
+    }
+    socket.isAlive = false;
+    try { socket.ping(); } catch { socket.terminate(); }
+  });
+}, 30_000);
 
-server.listen(PORT, () => console.log(`Listening on ${PORT}`));
+// Start
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`HTTP+WS listening on ${PORT} (path: ${WS_PATH})`);
+});
+
+// Graceful shutdown (Render sends SIGTERM on redeploy)
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down...');
+  clearInterval(checkAliveInterval);
+  server.close(() => {
+    // Close all WS clients
+    wss.clients.forEach(c => { try { c.close(); } catch {} });
+    console.log('Closed gracefully');
+    process.exit(0);
+  });
+});
