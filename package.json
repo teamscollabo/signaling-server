@@ -1,8 +1,8 @@
 {
   "name": "signaling-server",
   "version": "1.0.0",
-  "description": "",
-  "main": "server.js",
+  "description": "signaling server for Collabo",
+  "main": "server.js", 
   "scripts": {
     "start": "node server.js",
     "test": "echo \"Error: no test specified\" && exit 1"

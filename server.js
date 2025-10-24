@@ -21,9 +21,7 @@ const WS_PATH = process.env.WS_PATH || '/ws';
 
 // --- Security: allowed origins for WS upgrades ---
 const ALLOWED_ORIGINS = new Set([
-  'https://your-frontend.example.com',
-  'https://your-frontend.onrender.com',
-  // add dev origins if needed:
+  'https://collabo-r8vr1547i-collabo-teams-projects.vercel.app',
   'http://localhost:3000'
 ]);
 
