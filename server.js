@@ -22,7 +22,7 @@ const WS_PATH = process.env.WS_PATH || '/ws';
 // --- Security: allowed origins for WS upgrades ---
 const ALLOWED_ORIGINS = new Set([
   'https://collabo-seven.vercel.app',
-  'https://www.collaboeditor.dev',
+  'https://collaboeditor.dev',
   'http://localhost:3000'
 ]);
 
